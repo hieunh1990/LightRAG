@@ -982,6 +982,149 @@ def _extract_pdf_pypdf(file_bytes: bytes, password: str = None) -> str:
     return content
 
 
+async def _extract_pdf_ocr_gemini(file_bytes: bytes, model: str | None = None) -> str:
+    """Extract text from a scanned PDF using Gemini's native PDF vision.
+
+    Args:
+        file_bytes: PDF file content as bytes
+        model: Gemini model name (default: gemini-flash-lite-latest)
+
+    Returns:
+        str: OCR-extracted text content
+    """
+    import os
+
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+    except ImportError:
+        raise ImportError(
+            "google-genai package is required for Gemini OCR. "
+            "Install it with: pip install google-genai"
+        )
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+        "LLM_BINDING_API_KEY"
+    )
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY or LLM_BINDING_API_KEY must be set for Gemini OCR")
+
+    client = genai.Client(api_key=api_key)
+    model_name = model or "gemini-flash-lite-latest"
+
+    response = await client.aio.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"),
+            "Extract all text content from this scanned PDF document. "
+            "Return only the extracted text, preserving the original structure. "
+            "Do not add any commentary or formatting beyond what is in the document.",
+        ],
+    )
+
+    return response.text or ""
+
+
+async def _extract_pdf_ocr_olmocr(file_bytes: bytes, model: str | None = None) -> str:
+    """Extract text from a scanned PDF using olmOCR via DeepInfra.
+
+    Converts PDF pages to images using PyMuPDF, then sends them to
+    olmOCR model on DeepInfra's OpenAI-compatible API.
+
+    Args:
+        file_bytes: PDF file content as bytes
+        model: Model name (default: allenai/olmOCR-2-7B-1025)
+
+    Returns:
+        str: OCR-extracted text content
+    """
+    import os
+    import base64
+
+    try:
+        import fitz  # type: ignore  # PyMuPDF
+    except ImportError:
+        raise ImportError(
+            "PyMuPDF package is required for olmOCR. Install it with: pip install PyMuPDF"
+        )
+
+    try:
+        from openai import AsyncOpenAI  # type: ignore
+    except ImportError:
+        raise ImportError(
+            "openai package is required for olmOCR. Install it with: pip install openai"
+        )
+
+    api_key = os.environ.get("EMBEDDING_BINDING_API_KEY")
+    if not api_key:
+        raise ValueError("EMBEDDING_BINDING_API_KEY must be set for olmOCR (DeepInfra)")
+
+    model_name = model or "allenai/olmOCR-2-7B-1025"
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.deepinfra.com/v1/openai",
+    )
+
+    # Convert PDF pages to images
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    all_text = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this page. Return only the text content.",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        page_text = response.choices[0].message.content or ""
+        if page_text.strip():
+            all_text.append(page_text.strip())
+
+    doc.close()
+    return "\n\n".join(all_text)
+
+
+async def _extract_pdf_ocr(
+    file_bytes: bytes, engine: str, model: str | None = None
+) -> str:
+    """Dispatch PDF OCR to the configured engine.
+
+    Args:
+        file_bytes: PDF file content as bytes
+        engine: OCR engine name ("gemini" or "olmocr")
+        model: Optional model override
+
+    Returns:
+        str: OCR-extracted text content
+    """
+    if engine == "gemini":
+        return await _extract_pdf_ocr_gemini(file_bytes, model)
+    elif engine == "olmocr":
+        return await _extract_pdf_ocr_olmocr(file_bytes, model)
+    else:
+        raise ValueError(f"Unknown PDF OCR engine: {engine}. Use 'gemini' or 'olmocr'.")
+
+
 def _extract_docx(file_bytes: bytes) -> str:
     """Extract DOCX content including tables in document order (synchronous).
 
@@ -1386,6 +1529,27 @@ async def pipeline_enqueue_file(
                                 file,
                                 global_args.pdf_decrypt_password,
                             )
+
+                        # OCR fallback for scanned PDFs
+                        if (
+                            (not content or not content.strip())
+                            and global_args.pdf_ocr_enabled
+                        ):
+                            logger.info(
+                                f"[File Extraction]pypdf returned empty for {file_path.name}, "
+                                f"attempting OCR ({global_args.pdf_ocr_engine})"
+                            )
+                            try:
+                                content = await _extract_pdf_ocr(
+                                    file,
+                                    global_args.pdf_ocr_engine,
+                                    global_args.pdf_ocr_model,
+                                )
+                            except Exception as ocr_err:
+                                logger.error(
+                                    f"[File Extraction]OCR failed for {file_path.name}: {ocr_err}"
+                                )
+
                     except Exception as e:
                         error_files = [
                             {
